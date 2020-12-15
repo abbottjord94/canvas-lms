@@ -22,6 +22,18 @@ WORKSPACE=${WORKSPACE:-$(pwd)}
 # $WEBPACK_CACHE_TAG: $RUBY_RUNNER_TAG + final compiled assets
 # $1: final image for this build, including all rails code
 
+# Controls:
+# $CACHE_LOAD_SCOPE: the scope of the primary cache to load.
+#   - typically "master" for post-merge builds and <patchset_number> for pre-merge builds
+# $CACHE_LOAD_FALLBACK_SCOPE: the fallback scope if the primary scope doesn't exist
+#   - typically <patchset_number> for all builds.
+#   - pre-merge builds use this to cache re-trigger attempts and for new revisions without code changes
+#   - post-merge builds use this to pull images from previous pre-merge builds in case it is already built
+# $CACHE_SAVE_SCOPE: the scope to save the image under
+#   - always "master" for post-merge builds and <patchset_number> for pre-merge builds
+
+source ./build/new-jenkins/docker-build-helpers.sh
+
 DOCKER_BUILDKIT=1 docker build --file Dockerfile.jenkins-cache --tag "local/cache-helper-collect-gems" --target cache-helper-collect-gems "$WORKSPACE"
 DOCKER_BUILDKIT=1 docker build --file Dockerfile.jenkins-cache --tag "local/cache-helper-collect-yarn" --target cache-helper-collect-yarn "$WORKSPACE"
 DOCKER_BUILDKIT=1 docker build --file Dockerfile.jenkins-cache --tag "local/cache-helper-collect-packages" --target cache-helper-collect-packages "$WORKSPACE"
@@ -42,53 +54,105 @@ docker build \
   --tag "$RUBY_RUNNER_TAG" \
   - < Dockerfile.jenkins
 
-# Calculate the MD5SUM of all images / files that compiled webpack assets depend on.
-BASE_IMAGE_ID=$(docker images --filter=reference=local/ruby-runner --format '{{.ID}}')
-DOCKERFILE_CACHE_MD5=$( \
-  cat \
-    Dockerfile.jenkins.webpack-builder \
-    Dockerfile.jenkins.webpack-runner \
-    Dockerfile.jenkins.webpack-cache \
-  | md5sum | cut -d ' ' -f 1 \
+# Calculate Cache ID For webpack-cache
+RUBY_RUNNER_IMAGE_ID=$(docker images --filter=reference=local/ruby-runner --format '{{.ID}}')
+YARN_CACHE_MD5=$(docker run local/cache-helper-collect-yarn sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum")
+PACKAGES_CACHE_MD5=$(docker run local/cache-helper-collect-packages sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum")
+WEBPACK_CACHE_MD5=$(docker run local/cache-helper-collect-webpack sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum")
+YARN_RUNNER_DOCKERFILE_MD5=$(cat Dockerfile.jenkins.yarn-runner | md5sum)
+WEBPACK_BUILDER_DOCKERFILE_MD5=$(cat Dockerfile.jenkins.webpack-builder | md5sum)
+WEBPACK_CACHE_DOCKERFILE_MD5=$(cat Dockerfile.jenkins.webpack-cache | md5sum)
+
+WEBPACK_CACHE_BUILD_ARGS=(
+  --build-arg JS_BUILD_NO_UGLIFY="$JS_BUILD_NO_UGLIFY"
 )
-YARN_CACHE_MD5=$(docker run local/cache-helper-collect-yarn sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum | cut -d ' ' -f 1")
-PACKAGES_CACHE_MD5=$(docker run local/cache-helper-collect-packages sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum | cut -d ' ' -f 1")
-WEBPACK_CACHE_MD5=$(docker run local/cache-helper-collect-webpack sh -c "find /tmp/dst -type f -exec md5sum {} \; | sort -k 2 | md5sum | cut -d ' ' -f 1")
+YARN_RUNNER_PARTS=(
+  $RUBY_RUNNER_IMAGE_ID
+  $YARN_RUNNER_DOCKERFILE_MD5
+  $YARN_CACHE_MD5
+)
+WEBPACK_BUILDER_PARTS=(
+  "${YARN_RUNNER_PARTS[@]}"
+  $WEBPACK_BUILDER_DOCKERFILE_MD5
+  $PACKAGES_CACHE_MD5
+)
+WEBPACK_CACHE_PARTS=(
+  "${WEBPACK_BUILDER_PARTS[@]}"
+  "${WEBPACK_CACHE_BUILD_ARGS[@]}"
+  $WEBPACK_CACHE_DOCKERFILE_MD5
+  $WEBPACK_CACHE_MD5
+)
+declare -A WEBPACK_CACHE_TAGS; compute_tags "WEBPACK_CACHE_TAGS" $WEBPACK_CACHE_PREFIX ${WEBPACK_CACHE_PARTS[@]}
 
-WEBPACK_CACHE_ID=$(echo "$BASE_IMAGE_ID $DOCKERFILE_CACHE_MD5 $YARN_CACHE_MD5 $PACKAGES_CACHE_MD5 $WEBPACK_CACHE_MD5" | md5sum | cut -d' ' -f1)
-WEBPACK_CACHE_TAG="$WEBPACK_CACHE_PREFIX:$WEBPACK_CACHE_ID"
+# Build / Load Webpack Image
+WEBPACK_CACHE_SELECTED_TAG=""; pull_first_tag "WEBPACK_CACHE_SELECTED_TAG" ${WEBPACK_CACHE_TAGS[LOAD_TAG]} ${WEBPACK_CACHE_TAGS[LOAD_FALLBACK_TAG]}
 
-# If any webpack-related file has changed, we need to pull $WEBPACK_BUILDER_TAG and rebuild.
-exit_code=0
-./build/new-jenkins/docker-with-flakey-network-protection.sh pull $WEBPACK_CACHE_TAG || exit_code=$?
+if [ -z "${WEBPACK_CACHE_SELECTED_TAG}" ]; then
+  declare -A WEBPACK_BUILDER_TAGS; compute_tags "WEBPACK_BUILDER_TAGS" $WEBPACK_BUILDER_PREFIX ${WEBPACK_BUILDER_PARTS[@]}
+  declare -A YARN_RUNNER_TAGS; compute_tags "YARN_RUNNER_TAGS" $YARN_RUNNER_PREFIX ${YARN_RUNNER_PARTS[@]}
 
-if [[ "$exit_code" == "0" ]]; then
-  docker tag $WEBPACK_CACHE_TAG local/webpack-cache
-else
-  ./build/new-jenkins/docker-with-flakey-network-protection.sh pull $WEBPACK_BUILDER_CACHE_TAG || true
+  WEBPACK_BUILDER_SELECTED_TAG=""; pull_first_tag "WEBPACK_BUILDER_SELECTED_TAG" ${WEBPACK_BUILDER_TAGS[LOAD_TAG]} ${WEBPACK_BUILDER_TAGS[LOAD_FALLBACK_TAG]}
 
+  if [ -z "${WEBPACK_BUILDER_SELECTED_TAG}" ]; then
+    YARN_RUNNER_SELECTED_TAG=""; pull_first_tag "YARN_RUNNER_SELECTED_TAG" ${YARN_RUNNER_TAGS[LOAD_TAG]} ${YARN_RUNNER_TAGS[LOAD_FALLBACK_TAG]}
+
+    if [ -z "${YARN_RUNNER_SELECTED_TAG}" ]; then
+      docker build \
+        --tag "${YARN_RUNNER_TAGS[SAVE_TAG]}" \
+        - < Dockerfile.jenkins.yarn-runner
+
+      YARN_RUNNER_SELECTED_TAG=${YARN_RUNNER_TAGS[SAVE_TAG]}
+    fi
+
+    tag_many $YARN_RUNNER_SELECTED_TAG local/yarn-runner ${YARN_RUNNER_TAGS[SAVE_TAG]}
+
+    docker build \
+      --label "YARN_RUNNER_SELECTED_TAG=$YARN_RUNNER_SELECTED_TAG" \
+      --tag "${WEBPACK_BUILDER_TAGS[SAVE_TAG]}" \
+      ${WEBPACK_BUILDER_TAG:+ --tag "$WEBPACK_BUILDER_TAG"} \
+      - < Dockerfile.jenkins.webpack-builder
+
+    WEBPACK_BUILDER_SELECTED_TAG=${WEBPACK_BUILDER_TAGS[SAVE_TAG]}
+  else
+    YARN_RUNNER_SELECTED_TAG=$(docker inspect $WEBPACK_BUILDER_SELECTED_TAG --format '{{ .Config.Labels.YARN_RUNNER_SELECTED_TAG }}')
+
+    # If we're here, that means webpack-builder was re-used, so we need to ensure
+    # that the yarn-runner image is correctly tagged under the SAVE_TAG. The pull
+    # operation should be a no-op, since it's an ancestor to the webpack-builder
+    # image.
+    docker pull $YARN_RUNNER_SELECTED_TAG
+    docker tag $YARN_RUNNER_SELECTED_TAG ${YARN_RUNNER_TAGS[SAVE_TAG]}
+  fi
+
+  tag_many $WEBPACK_BUILDER_SELECTED_TAG local/webpack-builder ${WEBPACK_BUILDER_TAGS[SAVE_TAG]}
+
+  # Using a multi-stage build is safe for the below image because
+  # there is no expectation that we will need to use docker's
+  # built-in caching.
   docker build \
-    --cache-from $WEBPACK_BUILDER_CACHE_TAG \
-    --tag "local/webpack-builder" \
-    --tag "$WEBPACK_BUILDER_CACHE_TAG" \
-    ${WEBPACK_BUILDER_TAG:+ --tag "$WEBPACK_BUILDER_TAG"} \
-    - < Dockerfile.jenkins.webpack-builder
-
-  docker build \
-    --build-arg JS_BUILD_NO_UGLIFY="$JS_BUILD_NO_UGLIFY" \
-    --tag "local/webpack-runner" \
-    - < Dockerfile.jenkins.webpack-runner
-
-  docker build \
-    --tag "local/webpack-cache" \
-    --tag "$WEBPACK_CACHE_TAG" \
+    "${WEBPACK_CACHE_BUILD_ARGS[@]}" \
+    --label "WEBPACK_BUILDER_SELECTED_TAG=$WEBPACK_BUILDER_SELECTED_TAG" \
+    --label "YARN_RUNNER_SELECTED_TAG=$YARN_RUNNER_SELECTED_TAG" \
+    --tag "${WEBPACK_CACHE_TAGS[SAVE_TAG]}" \
+    --target webpack-cache \
     - < Dockerfile.jenkins.webpack-cache
+
+  WEBPACK_CACHE_SELECTED_TAG=${WEBPACK_CACHE_TAGS[SAVE_TAG]}
+else
+  YARN_RUNNER_SELECTED_TAG=$(docker inspect $WEBPACK_CACHE_SELECTED_TAG --format '{{ .Config.Labels.YARN_RUNNER_SELECTED_TAG }}')
+  WEBPACK_BUILDER_SELECTED_TAG=$(docker inspect $WEBPACK_CACHE_SELECTED_TAG --format '{{ .Config.Labels.WEBPACK_BUILDER_SELECTED_TAG }}')
 fi
 
+tag_many $WEBPACK_CACHE_SELECTED_TAG local/webpack-cache ${WEBPACK_CACHE_TAGS[SAVE_TAG]}
+
+# Build Final Image
 if [ -n "${1:-}" ]; then
   docker build \
     --build-arg COMPILE_ADDITIONAL_ASSETS="$COMPILE_ADDITIONAL_ASSETS" \
     --file Dockerfile.jenkins.final \
+    --label "WEBPACK_BUILDER_SELECTED_TAG=$WEBPACK_BUILDER_SELECTED_TAG" \
+    --label "WEBPACK_CACHE_SELECTED_TAG=$WEBPACK_CACHE_SELECTED_TAG" \
+    --label "YARN_RUNNER_SELECTED_TAG=$YARN_RUNNER_SELECTED_TAG" \
     --tag "$1" \
     "$WORKSPACE"
 fi

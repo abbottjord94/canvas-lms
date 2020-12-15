@@ -1217,37 +1217,34 @@ class Attachment < ActiveRecord::Base
   end
 
   def user_can_read_through_context?(user, session)
-    self.context.grants_right?(user, session, :read) ||
+    self.context&.grants_right?(user, session, :read) ||
       (self.context.is_a?(AssessmentQuestion) && self.context.user_can_see_through_quiz_question?(user, session))
   end
 
   set_policy do
     given { |user, session|
-      self.context.grants_right?(user, session, :manage_files) &&
+      self.context&.grants_right?(user, session, :manage_files) &&
         !self.associated_with_submission? &&
         (!self.folder || self.folder.grants_right?(user, session, :manage_contents))
     }
     can :delete and can :update
 
-    given { |user, session| self.context.grants_right?(user, session, :manage_files) }
+    given { |user, session| self.context&.grants_right?(user, session, :manage_files) }
     can :read and can :create and can :download and can :read_as_admin
 
     given { self.public? }
     can :read and can :download
 
-    given { |user, session| self.context.grants_right?(user, session, :read) } #students.include? user }
+    given { |user, session| self.context&.grants_right?(user, session, :read) } #students.include? user }
     can :read
 
-    given { |user, session| self.context.grants_right?(user, session, :read_as_admin) }
+    given { |user, session| self.context&.grants_right?(user, session, :read_as_admin) }
     can :read_as_admin
 
     given { |user, session|
       user_can_read_through_context?(user, session) && !self.locked_for?(user, :check_policies => true)
     }
     can :read and can :download
-
-    given { |user, session| self.context_type == 'Submission' && self.context.grant_right?(user, session, :comment) }
-    can :create
 
     given { |user, session|
         session && session['file_access_user_id'].present? &&
@@ -1701,8 +1698,10 @@ class Attachment < ActiveRecord::Base
       update_attribute(:workflow_state, 'processing')
     end
   rescue => e
+    error_level = e.is_a?(Canvadoc::UploadTimeout) ? :warn : :error
     update_attribute(:workflow_state, 'errored')
-    Canvas::Errors.capture(e, type: :canvadocs, attachment_id: id, annotatable: opts[:wants_annotation])
+    error_data = {type: :canvadocs, attachment_id: id, annotatable: opts[:wants_annotation]}
+    Canvas::Errors.capture(e, error_data, error_level)
 
     if attempt <= Setting.get('max_canvadocs_attempts', '5').to_i
       delay(n_strand: 'canvadocs_retries',

@@ -116,6 +116,7 @@ class AssignmentsController < ApplicationController
 
     js_env({
       ASSIGNMENT_ID: params[:id],
+      CONFETTI_ENABLED: @domain_root_account&.feature_enabled?(:confetti_for_assignments),
       COURSE_ID: @context.id,
       PREREQS: assignment_prereqs,
       SUBMISSION_ID: graphql_submisison_id
@@ -126,7 +127,7 @@ class AssignmentsController < ApplicationController
   end
 
   def show
-    if request.format.symbol == :json
+    if !request.format.html?
       return render body: "endpoint does not support #{request.format.symbol}", status: :bad_request
     end
     GuardRail.activate(:secondary) do

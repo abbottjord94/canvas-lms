@@ -202,6 +202,20 @@ describe InstFS do
           expect(Canvas::Security.decode_jwt(token, [ secret ])).to have_key(:jti)
         end
 
+        it "includes the original_url claim with the redirect param" do
+          original_url = "https://example.test/preview"
+          url = InstFS.authenticated_url(@attachment, original_url: original_url)
+          token = url.split(/token=/).last
+          expect(Canvas::Security.decode_jwt(token, [ secret ])[:original_url]).to eq(original_url + "?redirect=true")
+        end
+
+        it "doesn't include the original_url claim if already redirected" do
+          original_url = "https://example.test/preview?redirect=true"
+          url = InstFS.authenticated_url(@attachment, original_url: original_url)
+          token = url.split(/token=/).last
+          expect(Canvas::Security.decode_jwt(token, [ secret ])).not_to have_key(:original_url)
+        end
+
         describe "legacy api claims" do
           let(:root_account) { Account.default }
           let(:access_token) { instance_double("AccessToken", global_developer_key_id: 106) }
@@ -274,20 +288,10 @@ describe InstFS do
         end
       end
 
-      it "generates the same url within a cache window of time so it's not unique every time" do
-        url1 = InstFS.authenticated_thumbnail_url(@attachment)
-        url2 = InstFS.authenticated_thumbnail_url(@attachment)
-        expect(url1).to eq(url2)
-
-        Timecop.freeze(1.day.from_now) do
-          url3 = InstFS.authenticated_thumbnail_url(@attachment)
-          expect(url1).to_not eq(url3)
-
-          first_token = url1.split(/token=/).last
-          expect(->{
-            Canvas::Security.decode_jwt(first_token, [ secret ])
-          }).to raise_error(Canvas::Security::TokenExpired)
-        end
+      it "includes a jti in the token" do
+        url = InstFS.authenticated_thumbnail_url(@attachment, expires_in: 1.hour)
+        token = url.split(/token=/).last
+        expect(Canvas::Security.decode_jwt(token, [ secret ])).to have_key(:jti)
       end
 
     end

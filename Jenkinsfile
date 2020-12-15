@@ -110,8 +110,8 @@ def postFn(status) {
         'requestTime': requestEndTime - requestStartTime,
       ])
 
-      failureReport.publishReportFromArtifacts('Rspec Test Failures', "tmp/spec_failures/rspec/**/*")
-      failureReport.publishReportFromArtifacts('Selenium Test Failures', "tmp/spec_failures/selenium/**/*")
+      failureReport.publishReportFromArtifacts('Rspec Test Failures', 'rspec')
+      failureReport.publishReportFromArtifacts('Selenium Test Failures', 'selenium')
       failureReport.submit()
 
       if(status == 'SUCCESS' && configuration.isChangeMerged() && isPatchsetPublishable()) {
@@ -233,18 +233,6 @@ def slackSendCacheBuild(registryPath, block) {
 // builds always run correctly. We intentionally ignore overrides for version pins, docker image paths, etc when
 // running real post-merge builds.
 // =========
-def getBuildImage() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? configuration.buildRegistryPathDefault() : configuration.buildRegistryPath()
-}
-
-def getPatchsetTag() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.patchsetDefault() : imageTag.patchset()
-}
-
-def getPublishableTag() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.publishableTagDefault() : imageTag.publishableTag()
-}
-
 def getPluginVersion(plugin) {
   if(env.GERRIT_BRANCH.contains('stable/')) {
     return configuration.getString("pin-commit-$plugin", env.GERRIT_BRANCH)
@@ -254,26 +242,6 @@ def getPluginVersion(plugin) {
 
 def getSlackChannel() {
   return env.GERRIT_EVENT_TYPE == 'change-merged' ? '#canvas_builds' : '#devx-bots'
-}
-
-def getDependenciesMergeImage() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.dependenciesMergeImageDefault() : imageTag.dependenciesMergeImage()
-}
-
-def getDependenciesPatchsetImage() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.dependenciesPatchsetImageDefault() : imageTag.dependenciesPatchsetImage()
-}
-
-def getMergeTag() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.mergeTagDefault() : imageTag.mergeTag()
-}
-
-def getExternalTag() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? imageTag.externalTagDefault() : imageTag.externalTag()
-}
-
-def getDependenciesImage() {
-  return env.GERRIT_EVENT_TYPE == 'change-merged' ? configuration.dependenciesImageDefault() : configuration.dependenciesImage()
 }
 
 @groovy.transform.Field def CANVAS_BUILDS_REFSPEC_REGEX = /\[canvas\-builds\-refspec=(.+?)\]/
@@ -314,6 +282,8 @@ def rebaseHelper(branch, commitHistory = 100) {
 
 library "canvas-builds-library@${getCanvasBuildsRefspec()}"
 
+configuration.setUseCommitMessageFlags(env.GERRIT_EVENT_TYPE != 'change-merged')
+
 pipeline {
   agent none
   options {
@@ -325,7 +295,7 @@ pipeline {
     GERRIT_PORT = '29418'
     GERRIT_URL = "$GERRIT_HOST:$GERRIT_PORT"
     BUILD_REGISTRY_FQDN = configuration.buildRegistryFQDN()
-    BUILD_IMAGE = getBuildImage()
+    BUILD_IMAGE = configuration.buildRegistryPath()
     POSTGRES = configuration.postgres()
     POSTGRES_CLIENT = configuration.postgresClient()
     SKIP_CACHE = configuration.skipCache()
@@ -335,27 +305,33 @@ pipeline {
 
 
     // e.g. canvas-lms:01.123456.78-postgres-12-ruby-2.6
-    PATCHSET_TAG = getPatchsetTag()
+    PATCHSET_TAG = imageTag.patchset()
 
     // e.g. canvas-lms:01.123456.78-postgres-12-ruby-2.6
-    PUBLISHABLE_TAG = getPublishableTag()
+    PUBLISHABLE_TAG = imageTag.publishableTag()
 
     // e.g. canvas-lms:master when not on another branch
-    MERGE_TAG = getMergeTag();
+    MERGE_TAG = imageTag.mergeTag()
 
     // e.g. canvas-lms:01.123456.78; this is for consumers like Portal 2 who want to build a patchset
-    EXTERNAL_TAG = getExternalTag();
+    EXTERNAL_TAG = imageTag.externalTag()
 
     ALPINE_MIRROR = configuration.alpineMirror()
     NODE = configuration.node()
     RUBY = configuration.ruby() // RUBY_VERSION is a reserved keyword for ruby installs
 
-    RUBY_RUNNER_IMAGE = "$BUILD_IMAGE-ruby-runner:${configuration.gerritBranchSanitized()}"
-    WEBPACK_BUILDER_CACHE_IMAGE = "$BUILD_IMAGE-webpack-builder:${configuration.gerritBranchSanitized()}"
-    WEBPACK_BUILDER_IMAGE = "$BUILD_IMAGE-webpack-builder:${imageTagVersion()}-$TAG_SUFFIX"
+    JS_DEBUG_IMAGE = "$BUILD_IMAGE-js-debug:${imageTagVersion()}-$TAG_SUFFIX"
 
-    WEBPACK_CACHE_PREMERGE_PREFIX = "$BUILD_IMAGE-pre-merge-cache"
-    WEBPACK_CACHE_POSTMERGE_PREFIX = "$BUILD_IMAGE-post-merge-cache"
+    RUBY_RUNNER_IMAGE = "$BUILD_IMAGE-ruby-runner:${configuration.gerritBranchSanitized()}"
+
+    YARN_RUNNER_PREFIX = "$BUILD_IMAGE-yarn-runner"
+    WEBPACK_BUILDER_PREFIX = "$BUILD_IMAGE-webpack-builder"
+    WEBPACK_CACHE_PREFIX = "$BUILD_IMAGE-webpack-cache"
+
+    WEBPACK_BUILDER_IMAGE = "$WEBPACK_BUILDER_PREFIX:${imageTagVersion()}-$TAG_SUFFIX"
+
+    IMAGE_CACHE_BUILD_SCOPE = configuration.gerritChangeNumber()
+    IMAGE_CACHE_MERGE_SCOPE = configuration.gerritBranchSanitized()
 
     CASSANDRA_IMAGE_TAG=imageTag.cassandra()
     DYNAMODB_IMAGE_TAG=imageTag.dynamodb()
@@ -392,13 +368,25 @@ pipeline {
                 cleanAndSetup()
                 def refspecToCheckout = env.GERRIT_PROJECT == "canvas-lms" ? env.GERRIT_REFSPEC : env.CANVAS_LMS_REFSPEC
                 checkoutRepo("canvas-lms", refspecToCheckout, 100)
+
+                if(env.GERRIT_PROJECT != "canvas-lms") {
+                  dir(env.LOCAL_WORKDIR) {
+                    checkoutRepo(GERRIT_PROJECT, env.GERRIT_REFSPEC, 2)
+                  }
+
+                  // Plugin builds using the checkout above will create this @tmp file, we need to remove it
+                  sh 'rm -vr gems/plugins/*@tmp'
+                }
+
                 buildParameters += string(name: 'CANVAS_BUILDS_REFSPEC', value: "${env.CANVAS_BUILDS_REFSPEC}")
                 buildParameters += string(name: 'PATCHSET_TAG', value: "${env.PATCHSET_TAG}")
                 buildParameters += string(name: 'POSTGRES', value: "${env.POSTGRES}")
                 buildParameters += string(name: 'RUBY', value: "${env.RUBY}")
+
                 if (currentBuild.projectName.contains("rails-6")) {
                   buildParameters += string(name: 'CANVAS_RAILS6_0', value: "${env.CANVAS_RAILS6_0}")
                 }
+
                 // If modifying any of our Jenkinsfiles set JENKINSFILE_REFSPEC for sub-builds to use Jenkinsfiles in
                 // the gerrit rather than master.
                 if(env.GERRIT_PROJECT == 'canvas-lms' && git.changedFiles(jenkinsFiles, 'HEAD^') ) {
@@ -412,37 +400,30 @@ pipeline {
                   buildParameters += string(name: 'CANVAS_LMS_REFSPEC', value: env.CANVAS_LMS_REFSPEC)
                 }
 
-                pullGerritRepo('gerrit_builder', 'master', '.')
-                gems = readFile('gerrit_builder/canvas-lms/config/plugins_list').split()
+                gems = configuration.plugins()
                 echo "Plugin list: ${gems}"
-                // fetch plugins
-                gems.each { gem ->
-                  if (env.GERRIT_PROJECT == gem) {
-                    /* this is the commit we're testing */
-                    dir(env.LOCAL_WORKDIR) {
-                      checkoutRepo(GERRIT_PROJECT, env.GERRIT_REFSPEC, 2)
-                    }
+
+                def gemArgs = gems.collect {
+                  if (env.GERRIT_PROJECT == it) {
+                    ""
                   } else {
-                    pullGerritRepo(gem, getPluginVersion(gem), 'gems/plugins')
+                    "{ mkdir -p gems/plugins/$it && git archive --remote=ssh://gerrit.instructure.com:29418/$it ${getPluginVersion(it)} | tar -x -C 'gems/plugins/$it'; } &"
                   }
                 }
-                pullGerritRepo("qti_migration_tool", getPluginVersion('qti_migration_tool'), "vendor")
 
-                // Plugin builds using the checkout above will create this @tmp file, we need to remove it
-                sh(script: 'rm -vr gems/plugins/*@tmp', returnStatus: true)
-                sh 'mv -v gerrit_builder/canvas-lms/config/* config/'
-                sh 'rm -v config/cache_store.yml'
-                sh 'rm -vr gerrit_builder'
-                sh 'rm -v config/database.yml'
-                sh 'rm -v config/security.yml'
-                sh 'rm -v config/selenium.yml'
-                sh 'rm -v config/file_store.yml'
-                sh 'cp -v docker-compose/config/selenium.yml config/'
-                sh 'cp -vR docker-compose/config/new-jenkins/* config/'
-                sh 'cp -v config/delayed_jobs.yml.example config/delayed_jobs.yml'
-                sh 'cp -v config/domain.yml.example config/domain.yml'
-                sh 'cp -v config/external_migration.yml.example config/external_migration.yml'
-                sh 'cp -v config/outgoing_mail.yml.example config/outgoing_mail.yml'
+                gemArgs << "{ mkdir -p vendor/qti_migration_tool && git archive --remote=ssh://gerrit.instructure.com:29418/qti_migration_tool ${getPluginVersion('qti_migration_tool')} | tar -x -C 'vendor/qti_migration_tool'; } &"
+
+                credentials.withGerritCredentials {
+                  sh """#!/bin/bash
+                    set -ex
+
+                    ${gemArgs.join('\n')}
+
+                    for job in \$(jobs -p); do
+                      wait \$job || exit 1
+                    done
+                  """
+                }
               }
             }
 
@@ -467,46 +448,61 @@ pipeline {
                   sh './build/new-jenkins/docker-with-flakey-network-protection.sh pull $MERGE_TAG'
                   sh 'docker tag $MERGE_TAG $PATCHSET_TAG'
                 } else {
-                  def webpackCachePrefix = configuration.isChangeMerged() ? env.WEBPACK_CACHE_POSTMERGE_PREFIX : env.WEBPACK_CACHE_PREMERGE_PREFIX
+                  def cacheScope = configuration.isChangeMerged() ? env.IMAGE_CACHE_MERGE_SCOPE : env.IMAGE_CACHE_BUILD_SCOPE
 
-                  slackSendCacheBuild(webpackCachePrefix) {
+                  slackSendCacheBuild(env.WEBPACK_CACHE_PREFIX) {
                     withEnv([
-                      "RUBY_RUNNER_TAG=${env.RUBY_RUNNER_IMAGE}",
-                      "WEBPACK_BUILDER_CACHE_TAG=${env.WEBPACK_BUILDER_CACHE_IMAGE}",
-                      "WEBPACK_BUILDER_TAG=${env.WEBPACK_BUILDER_IMAGE}",
-                      "WEBPACK_CACHE_PREFIX=${webpackCachePrefix}",
+                      "CACHE_LOAD_SCOPE=${env.IMAGE_CACHE_MERGE_SCOPE}",
+                      "CACHE_LOAD_FALLBACK_SCOPE=${env.IMAGE_CACHE_BUILD_SCOPE}",
+                      "CACHE_SAVE_SCOPE=${cacheScope}",
                       "COMPILE_ADDITIONAL_ASSETS=${configuration.isChangeMerged() ? 1 : 0}",
-                      "JS_BUILD_NO_UGLIFY=${configuration.isChangeMerged() ? 0 : 1}"
+                      "JS_BUILD_NO_UGLIFY=${configuration.isChangeMerged() ? 0 : 1}",
+                      "RUBY_RUNNER_TAG=${env.RUBY_RUNNER_IMAGE}",
+                      "WEBPACK_BUILDER_PREFIX=${env.WEBPACK_BUILDER_PREFIX}",
+                      "WEBPACK_BUILDER_TAG=${env.WEBPACK_BUILDER_IMAGE}",
+                      "WEBPACK_CACHE_PREFIX=${env.WEBPACK_CACHE_PREFIX}",
+                      "YARN_RUNNER_PREFIX=${env.YARN_RUNNER_PREFIX}",
                     ]) {
                       sh "build/new-jenkins/docker-build.sh $PATCHSET_TAG"
                     }
                   }
                 }
 
+                sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $PATCHSET_TAG"
+
                 if(configuration.isChangeMerged()) {
-                  sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_BUILDER_CACHE_IMAGE || true"
-                  slackSendCacheAvailable(env.WEBPACK_BUILDER_CACHE_IMAGE)
+                  sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_BUILDER_PREFIX || true"
+                  slackSendCacheAvailable(env.WEBPACK_BUILDER_PREFIX)
+
+                  sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $YARN_RUNNER_PREFIX || true"
+                  slackSendCacheAvailable(env.YARN_RUNNER_PREFIX)
 
                   sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $RUBY_RUNNER_IMAGE"
                   slackSendCacheAvailable(env.RUBY_RUNNER_IMAGE)
 
-                  sh './build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_CACHE_POSTMERGE_PREFIX'
-                  slackSendCacheAvailable(env.WEBPACK_CACHE_POSTMERGE_PREFIX)
+                  sh './build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_CACHE_PREFIX'
+                  slackSendCacheAvailable(env.WEBPACK_CACHE_PREFIX)
 
                   def GIT_REV = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
                   sh "docker tag \$PATCHSET_TAG \$BUILD_IMAGE:${GIT_REV}"
 
                   sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push \$BUILD_IMAGE:${GIT_REV}"
+                } else {
+                  sh(script: """
+                    ./build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_BUILDER_PREFIX || true
+                    ./build/new-jenkins/docker-with-flakey-network-protection.sh push $YARN_RUNNER_PREFIX || true
+                    ./build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_CACHE_PREFIX
+                  """, label: 'upload pre-merge specific images')
                 }
-
-                sh "./build/new-jenkins/docker-with-flakey-network-protection.sh push $PATCHSET_TAG"
 
                 def hasWebpackBuilderImage = sh(script: "./build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_BUILDER_IMAGE", returnStatus: true)
 
                 // If we are unable to push up the webpack builder image, then this
                 // build should use the currently cached image.
                 if (hasWebpackBuilderImage != 0) {
-                  dockerUtils.tagRemote(env.WEBPACK_BUILDER_CACHE_IMAGE, env.WEBPACK_BUILDER_IMAGE)
+                  def webpackBuilderLabel = sh(script: "docker inspect $PATCHSET_TAG --format '{{ .Config.Labels.WEBPACK_BUILDER_SELECTED_TAG }}'", returnStdout: true)
+
+                  dockerUtils.tagRemote(webpackBuilderLabel, env.WEBPACK_BUILDER_IMAGE)
                 }
 
                 if (isPatchsetPublishable()) {
@@ -541,18 +537,22 @@ pipeline {
                   echo 'adding Build Docker Image Cache'
                   stages['Build Docker Image Cache'] = {
                     withEnv([
-                      "RUBY_RUNNER_TAG=${env.RUBY_RUNNER_IMAGE}",
-                      "WEBPACK_BUILDER_CACHE_TAG=${env.WEBPACK_BUILDER_CACHE_IMAGE}",
-                      "WEBPACK_CACHE_PREFIX=${env.WEBPACK_CACHE_PREMERGE_PREFIX}",
+                      "CACHE_LOAD_SCOPE=${env.IMAGE_CACHE_MERGE_SCOPE}",
+                      "CACHE_LOAD_FALLBACK_SCOPE=${env.IMAGE_CACHE_BUILD_SCOPE}",
+                      "CACHE_SAVE_SCOPE=${env.IMAGE_CACHE_MERGE_SCOPE}",
                       "COMPILE_ADDITIONAL_ASSETS=0",
-                      "JS_BUILD_NO_UGLIFY=1"
+                      "JS_BUILD_NO_UGLIFY=1",
+                      "RUBY_RUNNER_TAG=${env.RUBY_RUNNER_IMAGE}",
+                      "WEBPACK_BUILDER_PREFIX=${env.WEBPACK_BUILDER_PREFIX}",
+                      "WEBPACK_CACHE_PREFIX=${env.WEBPACK_CACHE_PREFIX}",
+                      "YARN_RUNNER_PREFIX=${env.YARN_RUNNER_PREFIX}",
                     ]) {
                       slackSendCacheBuild(env.PREMERGE_CACHE_IMAGE) {
                         sh "build/new-jenkins/docker-build.sh"
                       }
 
-                      sh "build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_CACHE_PREMERGE_PREFIX"
-                      slackSendCacheAvailable(env.WEBPACK_CACHE_PREMERGE_PREFIX)
+                      sh "build/new-jenkins/docker-with-flakey-network-protection.sh push $WEBPACK_CACHE_PREFIX"
+                      slackSendCacheAvailable(env.WEBPACK_CACHE_PREFIX)
                     }
                   }
                 }
@@ -561,7 +561,11 @@ pipeline {
                   echo 'adding Linters'
                   timedStage('Linters', stages, {
                     credentials.withGerritCredentials {
-                      sh 'build/new-jenkins/linters/run-gergich.sh'
+                      withEnv([
+                        "PLUGINS_LIST=${configuration.plugins().join(' ')}"
+                      ]) {
+                        sh 'build/new-jenkins/linters/run-gergich.sh'
+                      }
                     }
                     if (env.MASTER_BOUNCER_RUN == '1' && !configuration.isChangeMerged()) {
                       credentials.withMasterBouncerCredentials {
@@ -583,6 +587,17 @@ pipeline {
                     string(name: 'POSTGRES_IMAGE_TAG', value: "${env.POSTGRES_IMAGE_TAG}")
                   ]
                 )
+
+                if(configuration.getBoolean('upload-js-debug-image', 'false')) {
+                  echo 'adding Javascript (Debug Image Upload)'
+                  buildStage.makeFromJob('Javascript (Debug Image Upload)', '/Canvas/test-suites/JS', stages, buildParameters + [
+                      string(name: 'JS_DEBUG_IMAGE_TAG', value: env.JS_DEBUG_IMAGE),
+                      string(name: 'WEBPACK_BUILDER_TAG', value: env.WEBPACK_BUILDER_IMAGE),
+                      string(name: 'TEST_SUITE', value: "upload"),
+                      string(name: 'WEBPACK_BUILDER_TAG', value: env.WEBPACK_BUILDER_IMAGE),
+                    ], true, "testReport"
+                  )
+                }
 
                 echo 'adding Javascript (Jest)'
                 buildStage.makeFromJob('Javascript (Jest)', '/Canvas/test-suites/JS', stages, buildParameters + [

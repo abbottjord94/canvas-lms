@@ -386,7 +386,6 @@ describe 'RCE Next toolbar features', ignore_js_errors: true do
       end
 
       it 'should close on losing focus' do
-        skip('Adding this test causes the previous one to fail. Go figure!?!')
         in_frame rce_page_body_ifr_id do
           f('#tinymce').send_keys('') # focus
         end
@@ -395,6 +394,40 @@ describe 'RCE Next toolbar features', ignore_js_errors: true do
         expect(overflow_toolbar).to be_displayed
         f('#title').click
         expect(f('body')).not_to contain_css(overflow_toolbar_selector)
+      end
+    end
+
+    context 'in a narrow window' do
+      before :each do
+        rce_wysiwyg_state_setup(@course)
+        driver.manage.window.resize_to(500, 800)
+      end
+
+      it 'list button in overflow menu should indicate active when appropriate' do
+        click_list_button
+        more_toolbar_button.click
+        expect(list_button).to contain_css('.tox-tbtn--enabled')
+        click_list_button
+        more_toolbar_button.click
+        expect(list_button).not_to contain_css('.tox-tbtn--enabled')
+      end
+
+      it 'alignment button in overflow menu should indicate active when appropriate' do
+        click_align_button
+        more_toolbar_button.click
+        expect(align_button).to contain_css('.tox-tbtn--enabled')
+        click_align_button
+        more_toolbar_button.click
+        expect(align_button).not_to contain_css('.tox-tbtn--enabled')
+      end
+
+      it 'superscript button in overflow menu should indicate active when appropriate' do
+        click_superscript_button
+        more_toolbar_button.click
+        expect(superscript_button).to contain_css('.tox-tbtn--enabled')
+        click_superscript_button
+        more_toolbar_button.click
+        expect(superscript_button).not_to contain_css('.tox-tbtn--enabled')
       end
     end
 
